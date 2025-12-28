@@ -1,0 +1,21 @@
+# AI Workflow Builder - Backend Dependencies
+
+# LangGraph Agent
+langgraph>=0.2.0
+langgraph-prebuilt>=0.1.0
+langgraph-cli[inmem]
+
+# LangChain
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+
+# Composio Tool Router + MCP
+composio>=0.10.0
+langchain-mcp-adapters>=0.1.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# API Server
+fastapi>=0.100.0
+uvicorn>=0.23.0
