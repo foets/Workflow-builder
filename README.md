@@ -14,7 +14,7 @@ Build automation workflows using natural language. Powered by LangGraph and Comp
 - [Configuration](#configuration)
 - [Running the Application](#running-the-application)
 - [Available Integrations](#available-integrations)
-- [Tech Stack](#tech-stack)
+
 - [License](#license)
 
 ---
@@ -216,17 +216,6 @@ Via Composio's 500+ tool integrations:
 | Productivity | Notion, Trello, Asana, Linear |
 | Developer | GitHub, GitLab, Jira |
 | And more... | 500+ tools available |
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|------------|
-| Frontend | Next.js 14, React, TailwindCSS |
-| Backend | LangGraph, LangChain |
-| AI Model | OpenAI GPT-4 |
-| Integrations | Composio (MCP Protocol) |
 
 ---
 
