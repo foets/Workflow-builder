@@ -109,8 +109,8 @@ Optional:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/workflow-builder.git
-cd workflow-builder
+git clone https://github.com/foets/Workflow-builder.git
+cd Workflow-builder
 ```
 
 ### 2. Install Backend Dependencies
