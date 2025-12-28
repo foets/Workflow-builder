@@ -15,7 +15,7 @@ Build automation workflows using natural language. Powered by LangGraph and Comp
 - [Running the Application](#running-the-application)
 - [Available Integrations](#available-integrations)
 
-- [License](#license)
+
 
 ---
 
@@ -219,6 +219,4 @@ Via Composio's 500+ tool integrations:
 
 ---
 
-## License
 
-MIT
