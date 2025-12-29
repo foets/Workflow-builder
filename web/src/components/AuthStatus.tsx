@@ -70,7 +70,13 @@ export default function AuthStatus({ authStatus, onCheckAgain, onExecute }: Auth
                   Connect
                 </a>
               ) : (
-                <span className="text-[11px] text-[var(--text-secondary)]">Not connected</span>
+                <button
+                  onClick={onCheckAgain}
+                  className="text-[11px] px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+                  title="Fetch a Connect link"
+                >
+                  Connect
+                </button>
               )}
             </div>
           </div>

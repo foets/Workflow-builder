@@ -18,6 +18,7 @@ import json
 import os
 import re
 import time
+import uuid
 from typing import Annotated, Any, Literal, Optional
 from typing_extensions import TypedDict
 
@@ -241,7 +242,7 @@ def _redact_connect_urls(text: str) -> str:
         r"\1",
         text,
         flags=re.IGNORECASE,
-    )
+        )
     # Remove any remaining bare connect URLs.
     text = re.sub(r"https?://connect\.composio\.dev/link/[^\s\"')]+", "", text, flags=re.IGNORECASE)
     return text
@@ -269,6 +270,49 @@ def _extract_auth_status_from_tool_output(required_toolkits: list[str], tool_tex
     except Exception:
         data = None
 
+    _SCOPE_ERROR_PATTERNS = (
+        "insufficient authentication scopes",
+        "insufficient scopes",
+        "insufficient_permissions",
+        "insufficient permissions",
+        "insufficientperms",
+        )
+
+    def _first_connect_url(obj: Any) -> Optional[str]:
+        """Find the first Composio connect URL anywhere in a JSON-ish object."""
+        try:
+            if isinstance(obj, str) and "connect.composio.dev/link/" in obj:
+                return obj
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    u = _first_connect_url(v)
+                    if u:
+                        return u
+                return None
+            if isinstance(obj, list):
+                for it in obj:
+                    u = _first_connect_url(it)
+                    if u:
+                        return u
+                return None
+        except Exception:
+            return None
+        return None
+
+    def _contains_scope_error(obj: Any) -> bool:
+        """Detect scope/permission errors anywhere in an entry payload."""
+        try:
+            if isinstance(obj, str):
+                s = obj.lower()
+                return any(p in s for p in _SCOPE_ERROR_PATTERNS)
+            if isinstance(obj, dict):
+                return any(_contains_scope_error(v) for v in obj.values())
+            if isinstance(obj, list):
+                return any(_contains_scope_error(it) for it in obj)
+        except Exception:
+            return False
+        return False
+
     # Common structures:
     # - COMPOSIO_MANAGE_CONNECTIONS: {"successful":true,"data":{"results":{ "<toolkit>": {...} } } }
     # - COMPOSIO_SEARCH_TOOLS: data.toolkit_connection_statuses = [{toolkit, has_active_connection, ...}]
@@ -291,11 +335,20 @@ def _extract_auth_status_from_tool_output(required_toolkits: list[str], tool_tex
                     toolkits_map[tk]["error"] = cui["error"].get("message") or "Connection has an error"
                     # Treat scope/permission errors as NOT ready for execution.
                     toolkits_map[tk]["connected"] = False
+                # Some toolkits report scope issues in other string fields (status_message, results, etc.)
+                if _contains_scope_error(entry):
+                    toolkits_map[tk]["error"] = toolkits_map[tk].get("error") or "Insufficient permissions/scopes"
+                    toolkits_map[tk]["connected"] = False
                 # Connect URL (if present)
                 for k in ("redirect_url", "connect_url", "connectUrl", "connect_link", "connectLink", "url", "link"):
                     if isinstance(entry.get(k), str) and "connect.composio.dev/link/" in entry.get(k, ""):
                         toolkits_map[tk]["connect_url"] = entry.get(k)
                         break
+                # Fallback: connect URL can be nested in the entry.
+                if not toolkits_map[tk].get("connect_url"):
+                    u = _first_connect_url(entry)
+                    if u:
+                        toolkits_map[tk]["connect_url"] = u
 
         maybe_statuses = None
         if isinstance(data.get("data"), dict) and isinstance(data["data"].get("toolkit_connection_statuses"), list):
@@ -315,6 +368,9 @@ def _extract_auth_status_from_tool_output(required_toolkits: list[str], tool_tex
                 # Treat explicit errors as not ready
                 if entry.get("error"):
                     toolkits_map[tk]["error"] = str(entry.get("error"))
+                    toolkits_map[tk]["connected"] = False
+                if _contains_scope_error(entry):
+                    toolkits_map[tk]["error"] = toolkits_map[tk].get("error") or "Insufficient permissions/scopes"
                     toolkits_map[tk]["connected"] = False
 
     # If any connect URLs exist, assign them to any disconnected toolkits (best-effort)
@@ -479,6 +535,181 @@ def _resolve_config_placeholders(obj: Any, cfg: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Execute helpers (step placeholders + param normalization)
+# ---------------------------------------------------------------------------
+
+_STEPS_EXPR_RE = re.compile(
+    r"^steps\.(\d+)\.([A-Za-z_][A-Za-z0-9_]*)(\[\])?(?:\.(.+))?$", flags=re.IGNORECASE
+)
+_CAMEL_DETECT_RE = re.compile(r"[a-z][A-Z]")
+_CAMEL_TO_SNAKE_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _camel_to_snake(s: str) -> str:
+    return _CAMEL_TO_SNAKE_RE.sub("_", s).lower()
+
+
+def _snake_to_camel(s: str) -> str:
+    parts = [p for p in (s or "").split("_") if p]
+    if not parts:
+        return s
+    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+
+
+def _get_field(obj: Any, key: str) -> Any:
+    """Get a field from a dict with tolerant key matching (camelCase/snake_case)."""
+    if not isinstance(obj, dict):
+        return None
+    if key in obj:
+        return obj.get(key)
+    # Try snake_case / camelCase variants
+    snake = _camel_to_snake(key) if isinstance(key, str) else key
+    if isinstance(snake, str) and snake in obj:
+        return obj.get(snake)
+    camel = _snake_to_camel(key) if isinstance(key, str) else key
+    if isinstance(camel, str) and camel in obj:
+        return obj.get(camel)
+    # Case-insensitive fallback
+    lk = str(key).lower()
+    for k in obj.keys():
+        if isinstance(k, str) and k.lower() == lk:
+            return obj.get(k)
+    return None
+
+
+def _get_path_value(obj: Any, path: str) -> Any:
+    """Traverse dot path on dict/list; lists default to first element."""
+    cur: Any = obj
+    for seg in [p for p in (path or "").split(".") if p]:
+        if isinstance(cur, list):
+            cur = cur[0] if cur else None
+        if cur is None:
+            return None
+        if isinstance(cur, dict):
+            cur = _get_field(cur, seg)
+        elif not isinstance(cur, list):
+            # cur is neither list nor dict nor None - can't traverse further
+            return None
+    # After the loop, return whatever we got
+    if isinstance(cur, list):
+        return cur[0] if cur else None
+    return cur
+
+
+def _resolve_step_expr(expr: str, wf_steps: list[dict], step_results: dict) -> Any:
+    """
+    Resolve expressions like:
+    - steps.0.emails_list[].id
+    - steps.1.email_full.subject
+    - steps.3.doc_created.documentId
+    """
+    m = _STEPS_EXPR_RE.fullmatch((expr or "").strip())
+    if not m:
+        return None
+    idx = int(m.group(1))
+    out_key = m.group(2)
+    list_flag = bool(m.group(3))
+    tail = m.group(4) or ""
+
+    if idx < 0 or idx >= len(wf_steps) or not isinstance(wf_steps[idx], dict):
+        return None
+    step_id = wf_steps[idx].get("id") or f"step_{idx+1}"
+    entry = step_results.get(step_id)
+    if not isinstance(entry, dict):
+        return None
+    outputs_map = entry.get("outputs")
+    if not isinstance(outputs_map, dict):
+        return None
+    base = outputs_map.get(out_key)
+    if base is None:
+        return None
+
+    # If base is a JSON string, attempt to parse.
+    if isinstance(base, str) and base.strip().startswith("{"):
+        try:
+            base = json.loads(base)
+        except Exception:
+            pass
+
+    if list_flag:
+        # Prefer list; if dict, try common list containers.
+        if isinstance(base, dict):
+            base = base.get("messages") or base.get("items") or base
+        if isinstance(base, list):
+            if not tail:
+                return base[0] if base else None
+            vals = []
+            for it in base:
+                v = _get_path_value(it, tail)
+                if v is not None:
+                    vals.append(v)
+            return vals[0] if vals else None
+        # Not a list; fall back to scalar path.
+        v = _get_path_value(base, tail) if tail else base
+        return v
+
+    # Scalar path
+    return _get_path_value(base, tail) if tail else base
+
+
+def _resolve_step_placeholders(obj: Any, wf_steps: list[dict], step_results: dict) -> Any:
+    """Resolve `{{steps.*}}` placeholders in a JSON-ish structure (best-effort)."""
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        s = obj
+        m = re.fullmatch(r"\{\{\s*([^}]+?)\s*\}\}", s)
+        if m:
+            expr = (m.group(1) or "").strip()
+            if expr.lower().startswith("steps."):
+                v = _resolve_step_expr(expr, wf_steps, step_results)
+                return v if v is not None else s
+            return s
+
+        def _repl(match: re.Match[str]) -> str:
+            expr = (match.group(1) or "").strip()
+            if not expr.lower().startswith("steps."):
+                return match.group(0)
+            v = _resolve_step_expr(expr, wf_steps, step_results)
+            if v is None:
+                return match.group(0)
+            if isinstance(v, (dict, list)):
+                return json.dumps(v)
+            return str(v)
+
+        return _PLACEHOLDER_RE.sub(_repl, s)
+    if isinstance(obj, list):
+        return [_resolve_step_placeholders(v, wf_steps, step_results) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _resolve_step_placeholders(v, wf_steps, step_results) for k, v in obj.items()}
+    return obj
+
+
+def _normalize_param_keys(obj: Any, parent_key: Optional[str] = None) -> Any:
+    """
+    Convert camelCase keys to snake_case for tool arguments.
+    Heuristic: only converts keys containing a camel-case boundary (`[a-z][A-Z]`).
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, list):
+        return [_normalize_param_keys(v, parent_key=parent_key) for v in obj]
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            # Don't normalize column header maps etc.
+            if isinstance(parent_key, str) and parent_key.lower() in {"values"}:
+                out[k] = _normalize_param_keys(v, parent_key=str(k) if isinstance(k, str) else None)
+                continue
+            nk = k
+            if isinstance(k, str) and _CAMEL_DETECT_RE.search(k):
+                nk = _camel_to_snake(k)
+            out[nk] = _normalize_param_keys(v, parent_key=str(nk) if isinstance(nk, str) else None)
+        return out
+    return obj
+
+
+# ---------------------------------------------------------------------------
 # Composio tool initialization (meta tools)
 # ---------------------------------------------------------------------------
 
@@ -522,11 +753,10 @@ _composio_tools: list[BaseTool] = _init_composio_tools_sync()
 _composio_by_name = {t.name: t for t in _composio_tools if getattr(t, "name", None)}
 
 PREFLIGHT_TOOLS: list[BaseTool] = [t for n, t in _composio_by_name.items() if n == "COMPOSIO_MANAGE_CONNECTIONS"]
-EXECUTE_TOOLS: list[BaseTool] = [
-    t
-    for n, t in _composio_by_name.items()
-    if n in {"COMPOSIO_SEARCH_TOOLS", "COMPOSIO_MULTI_EXECUTE_TOOL", "COMPOSIO_GET_TOOL_SCHEMAS"}
-]
+
+# Execute mode should be deterministic and only execute pre-validated tool slugs.
+# Tool discovery / schema lookup happens in `execute_resolve_tools` before execution starts.
+EXECUTE_TOOLS: list[BaseTool] = [t for n, t in _composio_by_name.items() if n in {"COMPOSIO_MULTI_EXECUTE_TOOL"}]
 
 # region agent log
 _dbg_loop_state = "unknown"
@@ -562,10 +792,10 @@ def _env_model(name: str, default: str) -> str:
 # Defaults: keep behavior identical unless env vars are set.
 _DEFAULT_MODEL = _env_model("DEFAULT_LLM_MODEL", "gpt-5.2")
 _BUILD_MODEL = _env_model("BUILD_LLM_MODEL", "gpt-5.2")
-_PREFLIGHT_MODEL = _env_model("PREFLIGHT_LLM_MODEL", "gpt-5-nano")
+_PREFLIGHT_MODEL = _env_model("PREFLIGHT_LLM_MODEL", "gpt-5-mini")
 _CONFIGURE_MODEL = _env_model("CONFIGURE_LLM_MODEL", _PREFLIGHT_MODEL)
-_EXECUTE_TOOL_MODEL = _env_model("EXECUTE_TOOL_LLM_MODEL", "gpt-5-mini")
-_EXECUTE_INTERNAL_MODEL = _env_model("EXECUTE_INTERNAL_LLM_MODEL", "gpt-5-mini")
+_EXECUTE_TOOL_MODEL = _env_model("EXECUTE_TOOL_LLM_MODEL", "gpt-5.2")
+_EXECUTE_INTERNAL_MODEL = _env_model("EXECUTE_INTERNAL_LLM_MODEL", "gpt-5.2")
 
 
 build_llm = ChatOpenAI(model=_BUILD_MODEL)
@@ -757,7 +987,7 @@ def load_workflow_into_state(state: AgentState) -> dict:
         "agent.py:load_workflow_into_state",
         "load",
         {"workflow_id": workflow_id, "cache_hit": cache_hit, "found": found, "returned_keys": sorted(list(out.keys()))},
-    )
+        )
     # endregion agent log
     return out
 
@@ -875,7 +1105,7 @@ async def connections_assistant(state: AgentState) -> dict:
             workflow_name=wf.get("name", "Untitled"),
             required_toolkits=", ".join(required_toolkits) if required_toolkits else "None",
         )
-    )
+        )
     response = await preflight_llm_with_tools.ainvoke([sys_msg] + _messages_for_llm(state.get("messages", [])))
     # Never surface raw connect URLs in chat; UI renders connect buttons from auth_status.
     try:
@@ -966,6 +1196,22 @@ def _last_human_text(messages: list[AnyMessage]) -> str:
     return ""
 
 
+def _config_hint_for_key(key: str) -> str:
+    k = str(key or "").strip()
+    if not k:
+        return "List relevant resources (if possible) and let the user pick by number."
+    lk = k.lower()
+    if lk.endswith("_folder_id"):
+        return "This looks like a folder id. List folders (often via Google Drive) and ask the user to pick."
+    if lk.endswith("_spreadsheet_id"):
+        return "This looks like a spreadsheet id. List/search spreadsheets and ask the user to pick."
+    if lk.endswith("_tab_name") or lk.endswith("_sheet_name"):
+        return "This looks like a sheet/tab name. After you have the spreadsheet id, list tabs and ask the user to pick."
+    if lk.endswith("_doc_id") or lk.endswith("_document_id"):
+        return "This looks like a document id. List/search documents and ask the user to pick."
+    return "Try to list/search the relevant resources and let the user pick by number. Ask for manual ID only if listing fails."
+
+
 # ---------------------------------------------------------------------------
 # CONFIGURE loop (LLM-driven, prompt-regulated)
 # ---------------------------------------------------------------------------
@@ -1008,6 +1254,8 @@ async def configure_assistant(state: AgentState) -> dict:
         }
 
     bullets = "\n".join([f"- **{k}**" for k in missing[:20]]) if missing else "- None"
+    current_key = missing[0] if missing else ""
+    current_hint = _config_hint_for_key(str(current_key))
     cfg = wf.get("config") if isinstance(wf.get("config"), dict) else {}
     workflow_id = wf.get("id") if isinstance(wf.get("id"), str) else state.get("current_workflow_id")
     if not isinstance(workflow_id, str) or not workflow_id:
@@ -1023,10 +1271,12 @@ async def configure_assistant(state: AgentState) -> dict:
             workflow_id=workflow_id,
             required_toolkits=", ".join([str(t) for t in required_toolkits if isinstance(t, str)]) if required_toolkits else "None",
             missing_config_bullets=bullets,
+            current_config_key=str(current_key),
+            current_config_hint=str(current_hint),
             workflow_config_json=json.dumps(cfg, indent=2),
             tool_router_session_id=tool_router_session_id,
         )
-    )
+        )
 
     response = await configure_llm_with_tools.ainvoke([sys_msg] + _messages_for_llm(state.get("messages", [])))
     # Never surface raw connect URLs in chat; UI renders connect buttons from auth_status.
@@ -1049,7 +1299,7 @@ def configure_should_continue(state: AgentState) -> Literal["configure_tools", E
     last = messages[-1]
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "configure_tools"
-        return END
+    return END
     
 
 def configure_hydrate(state: AgentState) -> dict:
@@ -1132,6 +1382,451 @@ def configure_hydrate(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", flags=re.IGNORECASE)
+
+
+def _strip_pii_for_tool_search(text: str) -> str:
+    """Remove obvious PII (emails) from use_case strings sent to COMPOSIO_SEARCH_TOOLS."""
+    if not isinstance(text, str) or not text:
+        return ""
+    return _EMAIL_RE.sub("<email>", text).strip()
+
+
+def _use_case_for_step(step: dict) -> str:
+    """
+    Build a normalized, non-PII use_case string for COMPOSIO_SEARCH_TOOLS.
+    Keep this short and generic; do NOT include IDs/emails.
+    """
+    tool = step.get("tool") if isinstance(step.get("tool"), str) else ""
+    toolkit = step.get("toolkit") if isinstance(step.get("toolkit"), str) else ""
+    name = step.get("name") if isinstance(step.get("name"), str) else ""
+    tool_hint = tool.replace("_", " ").lower().strip()
+    parts = [p for p in [toolkit, tool_hint, name] if isinstance(p, str) and p.strip()]
+    use_case = " ".join([p.strip() for p in parts]).strip()
+    use_case = _strip_pii_for_tool_search(use_case)
+    return use_case[:240] if len(use_case) > 240 else use_case
+
+
+_CAMEL_1 = re.compile(r"(.)([A-Z][a-z]+)")
+_CAMEL_2 = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _to_snake_case(s: str) -> str:
+    s = str(s or "")
+    s = _CAMEL_1.sub(r"\\1_\\2", s)
+    s = _CAMEL_2.sub(r"\\1_\\2", s)
+    return s.replace("-", "_").lower()
+
+
+def _normalize_tool_params_for_slug(
+    tool_slug: str, tool_params: Any, schema_props: set[str], schema_required: set[str]
+) -> dict:
+    """
+    Best-effort normalize step.tool_params keys to match the tool schema.
+    Also applies a few common structural transforms for well-known tools.
+    """
+    params = tool_params if isinstance(tool_params, dict) else {}
+    out: dict[str, Any] = {}
+
+    # 1) Rename keys based on schema, but PRESERVE unknown keys.
+    for k, v in params.items():
+        if not isinstance(k, str):
+            continue
+        if k in schema_props:
+            out[k] = v
+            continue
+        snake = _to_snake_case(k)
+        if snake in schema_props:
+            out[snake] = v
+            continue
+        # Preserve unknown keys - the API may accept them even if not in schema
+        out[k] = v
+
+    slug_u = (tool_slug or "").upper()
+
+    # 2) Heuristic transforms per tool slug.
+    if slug_u == "GOOGLEDOCS_UPDATE_DOCUMENT_SECTION_MARKDOWN":
+        if "document_id" not in out:
+            if "documentId" in params:
+                out["document_id"] = params.get("documentId")
+            elif "document_id" in params:
+                out["document_id"] = params.get("document_id")
+        if "markdown_text" not in out:
+            if "text" in params:
+                out["markdown_text"] = params.get("text")
+            elif "markdown_text" in params:
+                out["markdown_text"] = params.get("markdown_text")
+        if "start_index" not in out:
+            out["start_index"] = 1
+
+    if slug_u == "GOOGLESHEETS_UPSERT_ROWS":
+        if "rows" not in out and isinstance(params.get("values"), dict):
+            values = params.get("values") or {}
+            headers = [str(k) for k in values.keys()]
+            row = [values.get(h) for h in headers]
+            out["headers"] = headers
+            out["rows"] = [row]
+
+        if "sheetName" in schema_props and "sheetName" not in out and "sheet_name" in params:
+            out["sheetName"] = params.get("sheet_name")
+        if "spreadsheetId" in schema_props and "spreadsheetId" not in out and "spreadsheet_id" in params:
+            out["spreadsheetId"] = params.get("spreadsheet_id")
+
+    if slug_u == "GMAIL_FETCH_EMAILS":
+        if "label_ids" not in out and isinstance(params.get("labelIds"), list):
+            out["label_ids"] = params.get("labelIds")
+        if "max_results" not in out and isinstance(params.get("maxResults"), int):
+            out["max_results"] = params.get("maxResults")
+
+    if slug_u == "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID":
+        if "message_id" not in out and isinstance(params.get("messageId"), str):
+            out["message_id"] = params.get("messageId")
+
+    # 3) Ensure required fields exist if present in original.
+    for req in schema_required:
+        if req in out:
+            continue
+        if req in params:
+            out[req] = params.get(req)
+
+    return out
+
+
+def _step_param_keys_upper(step: dict) -> set[str]:
+    params = step.get("tool_params")
+    if not isinstance(params, dict):
+        return set()
+    return {str(k).upper() for k in params.keys() if isinstance(k, str)}
+
+
+def _tool_slug_semantic_mismatch(tool_slug: str, step: dict) -> bool:
+    """
+    Best-effort guard: catch obviously wrong-but-valid tool slugs.
+    This is intentionally heuristic and limited to common patterns we rely on.
+    """
+    if not isinstance(tool_slug, str) or not tool_slug:
+        return False
+
+    slug_u = tool_slug.upper()
+    name_u = (step.get("name") or "").upper() if isinstance(step.get("name"), str) else ""
+    keys = _step_param_keys_upper(step)
+
+    wants_message_by_id = ("MESSAGEID" in keys) or ("MESSAGE_ID" in keys)
+    wants_text_write = ("TEXT" in keys) or ("MARKDOWN" in keys) or ("CONTENT" in keys)
+    wants_query = ("QUERY" in keys)
+    wants_title = ("TITLE" in keys)
+
+    # Gmail: if we have message_id/messageId, listing emails is almost certainly wrong.
+    if wants_message_by_id and ("FETCH_EMAILS" in slug_u or "LIST" in slug_u or "SEARCH" in slug_u):
+        return True
+
+    # Docs: if we are writing text/markdown, GET-by-id is not the right action.
+    if wants_text_write and ("GET_DOCUMENT_BY_ID" in slug_u or slug_u.endswith("_GET_DOCUMENT_BY_ID")):
+        return True
+
+    # Generic: if step name suggests writing/appending but slug is a GET.
+    if ("WRITE" in name_u or "APPEND" in name_u or "INSERT" in name_u or "UPDATE" in name_u) and (
+        "GET_" in slug_u and "GET_SHEET" not in slug_u
+    ):
+        return True
+
+    # Generic: if we have a query but tool slug is a get-by-id.
+    if wants_query and ("BY_ID" in slug_u or slug_u.startswith("GET_")):
+        return True
+
+    # Generic: if title is provided but tool isn't creating/copying.
+    if wants_title and ("CREATE" not in slug_u and "COPY" not in slug_u):
+        return True
+
+    return False
+
+
+def _pick_best_candidate_slug(candidates: list[str], step: dict) -> Optional[str]:
+    """
+    Choose best candidate among COMPOSIO_SEARCH_TOOLS suggestions.
+    We score based on step intent inferred from tool_params + step name.
+    """
+    if not candidates:
+        return None
+
+    keys = _step_param_keys_upper(step)
+    name_u = (step.get("name") or "").upper() if isinstance(step.get("name"), str) else ""
+
+    wants_message_by_id = ("MESSAGEID" in keys) or ("MESSAGE_ID" in keys)
+    wants_doc_id = ("DOCUMENTID" in keys) or ("DOCUMENT_ID" in keys)
+    wants_text_write = ("TEXT" in keys) or ("MARKDOWN" in keys) or ("CONTENT" in keys)
+    wants_query = ("QUERY" in keys)
+    wants_title = ("TITLE" in keys)
+
+    def score(slug: str) -> int:
+        su = slug.upper()
+        s = 0
+
+        if wants_message_by_id:
+            if "MESSAGE_BY_MESSAGE_ID" in su or ("MESSAGE" in su and "ID" in su):
+                s += 20
+            if "FETCH_EMAILS" in su or "LIST" in su:
+                s -= 10
+
+        if wants_doc_id:
+            if "DOCUMENT" in su and ("BY_ID" in su or "GET" in su):
+                s += 4  # doc id is still relevant for writes, but don't over-favor GET
+
+        if wants_text_write or ("WRITE" in name_u or "APPEND" in name_u or "INSERT" in name_u or "UPDATE" in name_u):
+            if any(k in su for k in ("INSERT", "UPDATE", "REPLACE", "APPEND", "UPSERT")):
+                s += 12
+            if "MARKDOWN" in su:
+                s += 3
+            if "GET_" in su or "GET_DOCUMENT_BY_ID" in su:
+                s -= 8
+
+        if wants_query or ("SEARCH" in name_u or "FIND" in name_u or "LIST" in name_u):
+            if any(k in su for k in ("FETCH_EMAILS", "SEARCH", "LIST", "FIND")):
+                s += 8
+            if "BY_ID" in su:
+                s -= 4
+
+        if wants_title or ("CREATE" in name_u):
+            if "CREATE" in su or "COPY" in su:
+                s += 10
+
+        return s
+
+    best = candidates[0]
+    best_score = score(best)
+    for cand in candidates[1:]:
+        sc = score(cand)
+        if sc > best_score:
+            best = cand
+            best_score = sc
+    return best
+
+
+async def execute_resolve_tools(state: AgentState) -> dict:
+    """
+    Validate that each tool-router step references a real Composio tool slug.
+    If invalid, auto-resolve via COMPOSIO_SEARCH_TOOLS and persist corrected slugs to disk.
+    """
+    _ensure_defaults(state)
+    wf = state.get("workflow")
+    if not isinstance(wf, dict):
+        return {}
+
+    steps = wf.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return {}
+
+    search_tool = _composio_by_name.get("COMPOSIO_SEARCH_TOOLS")
+    schemas_tool = _composio_by_name.get("COMPOSIO_GET_TOOL_SCHEMAS")
+    if search_tool is None or schemas_tool is None:
+        return {}
+
+    session_id = state.get("tool_router_session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        try:
+            res = await search_tool.ainvoke(
+                {"queries": [{"use_case": "resolve workflow tool slugs"}], "session": {"generate_id": True}}
+            )
+            data = json.loads(_tool_content_to_text(res) or "{}")
+            sid = data.get("data", {}).get("session", {}).get("id")
+            if isinstance(sid, str) and sid:
+                session_id = sid
+        except Exception:
+            session_id = ""
+
+    if not isinstance(session_id, str) or not session_id.strip():
+        return {
+            "error": "Could not establish a Tool Router session for tool validation.",
+            "messages": [
+                AIMessage(
+                    content=(
+                        "## Execution blocked\n\n"
+                        "I couldn't initialize the Tool Router session needed to validate tool slugs. "
+                        "Please confirm Composio is configured and try again."
+                    )
+                )
+            ],
+        }
+
+    changed = False
+    failures: list[dict[str, Any]] = []
+
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        tool = step.get("tool")
+        toolkit = step.get("toolkit")
+        if not isinstance(tool, str) or not tool:
+            continue
+        if step.get("execution_method") == "internal" or toolkit == "internal" or tool == "AI_PROCESS":
+            continue
+
+        semantic_mismatch = _tool_slug_semantic_mismatch(tool, step)
+
+        # Validate current slug exists
+        valid = False
+        try:
+            schema_res = await schemas_tool.ainvoke({"tool_slugs": [tool], "session_id": session_id})
+            schema_data = json.loads(_tool_content_to_text(schema_res) or "{}")
+            tool_schemas = schema_data.get("data", {}).get("tool_schemas", {})
+            not_found = schema_data.get("data", {}).get("not_found", [])
+            if isinstance(tool_schemas, dict) and tool in tool_schemas and not (
+                isinstance(not_found, list) and tool in not_found
+            ):
+                valid = True
+        except Exception:
+            valid = False
+
+        if not (valid and not semantic_mismatch):
+            # Resolve via search
+            use_case = _use_case_for_step(step) or "resolve tool slug"
+            try:
+                sr = await search_tool.ainvoke({"queries": [{"use_case": use_case}], "session": {"id": session_id}})
+                sr_data = json.loads(_tool_content_to_text(sr) or "{}")
+                result0 = None
+                results = sr_data.get("data", {}).get("results")
+                if isinstance(results, list) and results and isinstance(results[0], dict):
+                    result0 = results[0]
+
+                candidates: list[str] = []
+                if isinstance(result0, dict):
+                    primary = result0.get("primary_tool_slugs")
+                    related = result0.get("related_tool_slugs")
+                    tool_schemas2 = result0.get("tool_schemas")
+                    if isinstance(primary, list):
+                        candidates.extend([x for x in primary if isinstance(x, str) and x])
+                    if isinstance(related, list):
+                        candidates.extend([x for x in related if isinstance(x, str) and x])
+                    if isinstance(tool_schemas2, dict) and tool_schemas2:
+                        for k in tool_schemas2.keys():
+                            if isinstance(k, str) and k and k not in candidates:
+                                candidates.append(k)
+
+                candidate = _pick_best_candidate_slug(candidates, step)
+                if not isinstance(candidate, str) or not candidate:
+                    failures.append({"step_index": idx, "toolkit": toolkit, "old_tool": tool, "reason": "no_candidate"})
+                    continue
+
+                steps[idx] = {**step, "tool": candidate}
+                changed = True
+                _dbg_log(
+                    "H5",
+                    "agent.py:execute_resolve_tools",
+                    "tool_rewrite",
+                    {
+                        "step_index": idx,
+                        "old_tool": tool,
+                        "new_tool": candidate,
+                        "use_case": use_case,
+                        "semantic_mismatch": semantic_mismatch,
+                        "candidate_count": len(candidates),
+                    },
+                )
+            except Exception as e:
+                failures.append({"step_index": idx, "toolkit": toolkit, "old_tool": tool, "reason": type(e).__name__})
+
+        # Normalize tool_params for the FINAL slug (best-effort) so execute mode can call tools deterministically.
+        try:
+            cur_step = steps[idx] if idx < len(steps) and isinstance(steps[idx], dict) else step
+            final_tool = cur_step.get("tool")
+            final_toolkit = cur_step.get("toolkit")
+            if isinstance(final_tool, str) and final_tool:
+                schema_res2 = await schemas_tool.ainvoke({"tool_slugs": [final_tool], "session_id": session_id})
+                schema_data2 = json.loads(_tool_content_to_text(schema_res2) or "{}")
+                not_found2 = schema_data2.get("data", {}).get("not_found", [])
+                tool_schemas3 = schema_data2.get("data", {}).get("tool_schemas", {})
+                if isinstance(not_found2, list) and final_tool in not_found2:
+                    failures.append(
+                        {"step_index": idx, "toolkit": final_toolkit, "old_tool": final_tool, "reason": "not_found"}
+                    )
+                else:
+                    sch = tool_schemas3.get(final_tool) if isinstance(tool_schemas3, dict) else None
+                    schema_props: set[str] = set()
+                    schema_required: set[str] = set()
+                    if isinstance(sch, dict) and isinstance(sch.get("input_schema"), dict):
+                        props = sch["input_schema"].get("properties")
+                        if isinstance(props, dict):
+                            schema_props = {str(k) for k in props.keys() if isinstance(k, str)}
+                        req = sch["input_schema"].get("required")
+                        if isinstance(req, list):
+                            schema_required = {str(x) for x in req if isinstance(x, str)}
+
+                    if schema_props:
+                        params = cur_step.get("tool_params")
+                        normalized = _normalize_tool_params_for_slug(final_tool, params, schema_props, schema_required)
+                        if isinstance(normalized, dict) and normalized != params:
+                            steps[idx] = {**cur_step, "tool_params": normalized}
+                            changed = True
+                            _dbg_log(
+                                "H5",
+                                "agent.py:execute_resolve_tools",
+                                "params_normalized",
+                                {"step_index": idx, "tool": final_tool, "changed_keys": list(normalized.keys())[:20]},
+                            )
+        except Exception:
+            # best-effort only
+            pass
+
+    if failures:
+        bullets = "\n".join(
+            [
+                f"- Step {f.get('step_index')}: toolkit `{f.get('toolkit')}` tool `{f.get('old_tool')}` ({f.get('reason')})"
+                for f in failures[:10]
+            ]
+        )
+        return {
+            "error": "Some step tools could not be resolved to valid Composio slugs.",
+            "messages": [
+                AIMessage(
+                    content=(
+                        "## Execution blocked\n\n"
+                        "I couldn't resolve one or more workflow tools to valid Tool Router slugs:\n\n"
+                        f"{bullets}\n\n"
+                        "Please adjust the workflow steps and try again."
+                    )
+                )
+            ],
+            "tool_router_session_id": session_id,
+        }
+
+    out: dict[str, Any] = {"tool_router_session_id": session_id, "error": None}
+    if changed:
+        try:
+            model = Workflow.model_validate(wf)
+            saved = await asyncio.to_thread(save_workflow, model)
+            saved_json = saved.model_dump(mode="json")
+            out.update(
+                {
+                    "workflow": saved_json,
+                    "workflow_markdown": _render_workflow_markdown(saved),
+                    "missing_config_keys": _missing_config_keys(saved_json),
+                }
+            )
+        except Exception as e:
+            import traceback
+            err_detail = f"{type(e).__name__}: {e}"
+            print(f"[execute_resolve_tools] Failed to persist: {err_detail}")
+            traceback.print_exc()
+            out.update(
+                {
+                    "error": f"Failed to persist resolved tool slugs: {err_detail}",
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "## Execution blocked\n\n"
+                                f"I resolved tool slugs but failed to persist the updated workflow.\n\n**Error:** {err_detail}\n\nPlease try again."
+                            )
+                        )
+                    ],
+                }
+            )
+    return out
+
+
+def execute_resolve_should_continue(state: AgentState) -> Literal["execute_assistant", END]:
+    return END if state.get("error") else "execute_assistant"
+
+
 async def execute_assistant(state: AgentState) -> dict:
     _ensure_defaults(state)
     wf = state.get("workflow")
@@ -1162,12 +1857,11 @@ async def execute_assistant(state: AgentState) -> dict:
                 entry = toolkits_map.get(tk)
                 if not (isinstance(entry, dict) and bool(entry.get("connected")) and not entry.get("error")):
                     ok = False
-                    break
         else:
             ok = False
 
         if not ok:
-        return {
+            return {
                 "messages": [
                     AIMessage(
                         content=(
@@ -1214,11 +1908,19 @@ async def execute_assistant(state: AgentState) -> dict:
     cfg = wf.get("config") if isinstance(wf.get("config"), dict) else {}
     raw_params = step.get("tool_params", {}) or {}
     resolved_params = _resolve_config_placeholders(raw_params, cfg) if isinstance(cfg, dict) else raw_params
+    # Resolve `{{steps.*}}` placeholders from prior step_results (best-effort).
+    step_results = state.get("step_results", {}) if isinstance(state.get("step_results"), dict) else {}
+    resolved_params = _resolve_step_placeholders(resolved_params, steps, step_results)
+    # Normalize argument keys (camelCase -> snake_case) for Composio tools.
+    resolved_params = _normalize_param_keys(resolved_params)
 
     sys_msg = SystemMessage(
         content=EXECUTE_SYSTEM_PROMPT_TEMPLATE.format(
             workflow_name=wf.get("name", "Untitled"),
             workflow_description=wf.get("description", ""),
+            tool_router_session_id=(
+                state.get("tool_router_session_id") if isinstance(state.get("tool_router_session_id"), str) else ""
+            ),
             step_order=step.get("order", cursor + 1),
             total_steps=len(steps),
             step_name=step.get("name", ""),
@@ -1228,21 +1930,52 @@ async def execute_assistant(state: AgentState) -> dict:
             step_params_json=json.dumps(resolved_params, indent=2),
             step_results_json=json.dumps(state.get("step_results", {}), indent=2),
         )
-    )
+        )
 
-    # Internal steps: do NOT bind Tool Router tools (hard guarantee).
-    llm = execute_llm_internal if is_internal else execute_llm_with_tools
-    response = await llm.ainvoke([sys_msg] + _messages_for_llm(state.get("messages", [])))
-    return {"messages": [response]}
+    if is_internal:
+        # Internal steps: do NOT bind Tool Router tools (hard guarantee).
+        # Check if the prompt wants JSON output - if so, use response_format
+        prompt_text = str(resolved_params.get("prompt", "")).lower()
+        wants_json = any(kw in prompt_text for kw in ["json", '{"', "output the json"])
+        
+        if wants_json:
+            # Use OpenAI's response_format for reliable JSON output
+            json_llm = ChatOpenAI(model=_EXECUTE_INTERNAL_MODEL, model_kwargs={"response_format": {"type": "json_object"}})
+            response = await json_llm.ainvoke([sys_msg] + _messages_for_llm(state.get("messages", [])))
+        else:
+            response = await execute_llm_internal.ainvoke([sys_msg] + _messages_for_llm(state.get("messages", [])))
+        return {"messages": [response]}
+
+    # External steps: deterministically execute the pre-validated tool slug.
+    session_id = state.get("tool_router_session_id") if isinstance(state.get("tool_router_session_id"), str) else ""
+    tc_id = f"call_{uuid.uuid4().hex}"
+    tool_call = {
+        "id": tc_id,
+        "type": "tool_call",
+        "name": "COMPOSIO_MULTI_EXECUTE_TOOL",
+        "args": {
+            "tools": [
+                {
+                    "tool_slug": str(step_tool),
+                    "arguments": resolved_params if isinstance(resolved_params, dict) else {},
+                }
+            ],
+            "session_id": session_id,
+            "current_step": f"STEP_{int(step.get('order', cursor + 1))}",
+            "next_step": f"STEP_{int(step.get('order', cursor + 1)) + 1}",
+        },
+    }
+    return {"messages": [AIMessage(content="", tool_calls=[tool_call])]}
 
 
-def execute_should_continue(state: AgentState) -> Literal["execute_tools", "execute_advance", END]:
+def execute_should_continue(state: AgentState) -> Literal["execute_tools", "execute_advance", "execute_fail", END]:
     messages = state.get("messages", [])
-    decision: Literal["execute_tools", "execute_advance", END] = END
+    decision: Literal["execute_tools", "execute_advance", "execute_fail", END] = END
     last_type: Optional[str] = None
     has_tool_calls = False
     cursor = int(state.get("execution_cursor", 0))
     steps_len: Optional[int] = None
+    blocked = False
 
     if not messages:
         decision = END
@@ -1263,6 +1996,7 @@ def execute_should_continue(state: AgentState) -> Literal["execute_tools", "exec
                 if _extract_connect_urls(text) or (
                     isinstance(last, ToolMessage) and getattr(last, "status", None) == "error"
                 ):
+                    blocked = True
                     decision = END
                     _dbg_log(
                         "H5",
@@ -1275,18 +2009,36 @@ def execute_should_continue(state: AgentState) -> Literal["execute_tools", "exec
                 pass
 
             wf = state.get("workflow")
-            if isinstance(wf, dict) and isinstance(wf.get("steps"), list):
+            if not (isinstance(wf, dict) and isinstance(wf.get("steps"), list)):
+                decision = END
+            else:
                 steps_len = len(wf["steps"])
                 if cursor >= steps_len:
                     decision = END
-                elif state.get("mode") == "execute" and decision != END:
-                    decision = "execute_advance"
+                elif state.get("mode") == "execute" and not blocked:
+                    # Not blocked by auth/tool errors. Decide based on current step type.
+                    step = wf["steps"][cursor] if cursor < steps_len else None
+                    step_id = step.get("id") if isinstance(step, dict) else f"step_{cursor+1}"
+                    is_internal = False
+                    if isinstance(step, dict):
+                        tool = step.get("tool") or ""
+                        toolkit = step.get("toolkit") or ""
+                        is_internal = bool(
+                            step.get("execution_method") == "internal" or toolkit == "internal" or tool == "AI_PROCESS"
+                        )
+                    
+                    # Check if tools have already run for this step (result stored in step_results)
+                    step_results = state.get("step_results") or {}
+                    has_result = step_id in step_results and step_results[step_id] is not None
+                    
+                    if is_internal or has_result:
+                        # Internal step (LLM output is result) OR external step completed (tools ran)
+                        decision = "execute_advance"
+                    else:
+                        # External step but no tools were called and no result yet - that's a failure
+                        decision = "execute_fail"
                 else:
                     decision = END
-            elif state.get("mode") == "execute" and decision != END:
-                decision = "execute_advance"
-            else:
-                decision = END
 
     # region agent log
     _dbg_log(
@@ -1301,7 +2053,7 @@ def execute_should_continue(state: AgentState) -> Literal["execute_tools", "exec
             "steps_len": steps_len,
             "decision": decision if decision != END else "END",
         },
-    )
+        )
     # endregion agent log
     return decision
 
@@ -1349,6 +2101,17 @@ def execute_hydrate(state: AgentState) -> dict:
                         tool_text = _tool_content_to_text(tm.content)
                         updated_results = dict(state.get("step_results", {}) or {})
 
+                        # Capture Tool Router session id if present (COMPOSIO meta tools often echo it).
+                        try:
+                            payload = json.loads(tool_text) if tool_text else None
+                            sid = None
+                            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                                sid = payload["data"].get("session", {}).get("id")
+                            if isinstance(sid, str) and sid:
+                                out["tool_router_session_id"] = sid
+                        except Exception:
+                            pass
+
                         # Normalize shape:
                         # step_results[step_id] = {
                         #   "tool_outputs": { ... },
@@ -1380,6 +2143,133 @@ def execute_hydrate(state: AgentState) -> dict:
     _dbg_log("H5", "agent.py:execute_hydrate", "hydrate", dbg)
     # endregion agent log
     return out
+
+
+def _tool_failure_reason(tool_text: str) -> Optional[str]:
+    """Best-effort parse of Composio meta-tool JSON failures."""
+    if not isinstance(tool_text, str) or not tool_text.strip():
+        return None
+    try:
+        data = json.loads(tool_text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    # Common pattern: {"successful": false, "error": "...", "data": {...}}
+    if data.get("successful") is False:
+        err = data.get("error")
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+
+    d = data.get("data")
+    if isinstance(d, dict):
+        if d.get("success") is False:
+            err = d.get("error")
+            if isinstance(err, str) and err.strip():
+                return err.strip()
+
+            results = d.get("results")
+            if isinstance(results, list):
+                for r in [x for x in results if isinstance(x, dict)]:
+                    if isinstance(r.get("error"), str) and r.get("error").strip():
+                        return str(r.get("error")).strip()
+
+                    resp = r.get("response")
+                    if isinstance(resp, dict):
+                        if isinstance(resp.get("error"), str) and resp.get("error").strip():
+                            return str(resp.get("error")).strip()
+                        # sometimes nested
+                        if (
+                            isinstance(resp.get("data"), dict)
+                            and isinstance(resp["data"].get("error"), str)
+                            and resp["data"].get("error").strip()
+                        ):
+                            return str(resp["data"]["error"]).strip()
+
+        not_found = d.get("not_found")
+        if isinstance(not_found, list) and not_found:
+            return f"Tool(s) not found: {', '.join([str(x) for x in not_found[:5]])}"
+
+    return None
+
+
+def execute_after_tool_should_continue(state: AgentState) -> Literal["execute_advance", "execute_fail"]:
+    """After ToolNode, decide whether to advance or fail (stop-on-error)."""
+    tm = _last_tool_message(state.get("messages", []))
+    if tm is None:
+        return "execute_fail"
+    if getattr(tm, "status", None) == "error":
+        return "execute_fail"
+    tool_text = _tool_content_to_text(getattr(tm, "content", ""))
+    if _extract_connect_urls(tool_text):
+        return "execute_fail"
+    if _tool_failure_reason(tool_text):
+        return "execute_fail"
+    return "execute_advance"
+
+
+def execute_fail(state: AgentState) -> dict:
+    """Mark the current step/workflow failed and stop execution with a clean message."""
+    wf = state.get("workflow")
+    if not isinstance(wf, dict):
+        return {"error": "Execution failed: workflow not loaded."}
+
+    steps = wf.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return {"error": "Execution failed: workflow has no steps."}
+
+    cursor = int(state.get("execution_cursor", 0))
+    if cursor < 0:
+        cursor = 0
+    step_name = ""
+    step_tool = ""
+    if cursor < len(steps) and isinstance(steps[cursor], dict):
+        steps[cursor]["status"] = "failed"
+        step_name = str(steps[cursor].get("name") or "")
+        step_tool = str(steps[cursor].get("tool") or "")
+    wf["status"] = "failed"
+
+    messages = state.get("messages", []) or []
+    last_msg = messages[-1] if messages else None
+
+    reason: Optional[str] = None
+    # If we failed because the assistant didn't make tool calls for an external step.
+    if isinstance(last_msg, AIMessage) and not getattr(last_msg, "tool_calls", None):
+        reason = "Expected a Tool Router call for this step, but none were made."
+    else:
+        tm = _last_tool_message(messages)
+        tool_text = _tool_content_to_text(getattr(tm, "content", "")) if tm else ""
+        reason = _tool_failure_reason(tool_text) or (
+            str(getattr(tm, "content", "")).strip() if getattr(tm, "status", None) == "error" else None
+        )
+    reason = reason or "Tool execution failed."
+
+    # Persist best-effort
+    try:
+        saved = save_workflow(Workflow.model_validate(wf))
+        wf_json = saved.model_dump(mode="json")
+        wf_md = _render_workflow_markdown(saved)
+    except Exception:
+        wf_json = wf
+        wf_md = state.get("workflow_markdown")
+
+        return {
+        "workflow": wf_json,
+        "workflow_markdown": wf_md,
+        "error": reason,
+        "messages": [
+            AIMessage(
+                content=(
+                    "## Execution failed\n\n"
+                    f"- **Step**: {cursor + 1}\n"
+                    f"- **Name**: {step_name or '(unknown)'}\n"
+                    f"- **Tool**: `{step_tool or '(unknown)'}`\n\n"
+                    f"**Reason**: {reason}\n"
+                )
+            )
+        ],
+    }
 
 
 def execute_advance(state: AgentState) -> dict:
@@ -1437,10 +2327,79 @@ def execute_advance(state: AgentState) -> dict:
 
             output_value = None
             if is_internal:
-                output_value = entry.get("assistant_output")
+                raw_output = entry.get("assistant_output")
+                output_value = raw_output
+                # Best-effort: parse JSON from internal AI step output
+                if isinstance(raw_output, str):
+                    stripped = raw_output.strip()
+                    # Handle markdown code fences
+                    if stripped.startswith("```json"):
+                        stripped = stripped[7:]
+                    if stripped.startswith("```"):
+                        stripped = stripped[3:]
+                    if stripped.endswith("```"):
+                        stripped = stripped[:-3]
+                    stripped = stripped.strip()
+                    if stripped.startswith("{") and stripped.endswith("}"):
+                        try:
+                            output_value = json.loads(stripped)
+                        except Exception:
+                            pass  # Keep raw text if parsing fails
+                    # Fallback: extract subject from Markdown patterns
+                    if not isinstance(output_value, dict) and isinstance(raw_output, str):
+                        subject_match = None
+                        import re
+                        # Try common patterns
+                        patterns = [
+                            r'^#\s+(.+)$',  # # Title
+                            r'Subject:\s*(.+?)(?:\n|$)',  # Subject: ...
+                            r'\*\*Subject\*\*:\s*(.+?)(?:\n|$)',  # **Subject**: ...
+                        ]
+                        for pat in patterns:
+                            m = re.search(pat, raw_output, re.MULTILINE | re.IGNORECASE)
+                            if m:
+                                subject_match = m.group(1).strip()
+                                break
+                        if subject_match:
+                            output_value = {
+                                "subject": subject_match[:100],
+                                "summary_md": raw_output,
+                            }
             else:
-                output_value = tool_outputs.get("COMPOSIO_MULTI_EXECUTE_TOOL") or tool_outputs.get("tool")
+                raw_tool_text = tool_outputs.get("COMPOSIO_MULTI_EXECUTE_TOOL") or tool_outputs.get("tool")
+                output_value = raw_tool_text
+                # Best-effort: parse COMPOSIO_MULTI_EXECUTE_TOOL output and store the primary response data.
+                if isinstance(raw_tool_text, str) and raw_tool_text.strip().startswith("{"):
+                    try:
+                        payload = json.loads(raw_tool_text)
+                        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                            results = payload["data"].get("results")
+                            if isinstance(results, list) and results:
+                                # Collect response.data for each tool call
+                                extracted: list[Any] = []
+                                for r in [x for x in results if isinstance(x, dict)]:
+                                    resp = r.get("response")
+                                    if isinstance(resp, dict) and "data" in resp:
+                                        extracted.append(resp.get("data"))
+                                    elif resp is not None:
+                                        extracted.append(resp)
+                                if len(extracted) == 1:
+                                    output_value = extracted[0]
+                                elif extracted:
+                                    output_value = extracted
+                    except Exception:
+                        # keep raw text if parsing fails
+                        output_value = raw_tool_text
 
+                # Shape common list outputs to match existing placeholder style (e.g., emails_list[].id)
+                if isinstance(output_value, dict) and isinstance(outputs_name, str) and outputs_name.endswith("_list"):
+                    lst = next(
+                        (output_value.get(k) for k in ("messages", "items", "rows", "data") if isinstance(output_value.get(k), list)),
+                        None,
+                    )
+                    if isinstance(lst, list):
+                        output_value = lst
+        
             outputs_map = entry.get("outputs")
             if not isinstance(outputs_map, dict):
                 outputs_map = {}
@@ -1566,16 +2525,20 @@ builder.add_conditional_edges("configure_assistant", configure_should_continue, 
 
 # Execute loop
 builder.add_node("execute_load", load_workflow_into_state)
+builder.add_node("execute_resolve_tools", execute_resolve_tools)
 builder.add_node("execute_assistant", execute_assistant)
 builder.add_node("execute_tools", ToolNode(EXECUTE_TOOLS, handle_tool_errors=True))
 builder.add_node("execute_hydrate", execute_hydrate)
 builder.add_node("execute_advance", execute_advance)
+builder.add_node("execute_fail", execute_fail)
 
-builder.add_edge("execute_load", "execute_assistant")
+builder.add_edge("execute_load", "execute_resolve_tools")
+builder.add_conditional_edges("execute_resolve_tools", execute_resolve_should_continue, ["execute_assistant", END])
 builder.add_edge("execute_tools", "execute_hydrate")
-builder.add_edge("execute_hydrate", "execute_assistant")
-builder.add_conditional_edges("execute_assistant", execute_should_continue, ["execute_tools", "execute_advance", END])
+builder.add_conditional_edges("execute_hydrate", execute_after_tool_should_continue, ["execute_advance", "execute_fail"])
+builder.add_conditional_edges("execute_assistant", execute_should_continue, ["execute_tools", "execute_advance", "execute_fail", END])
 builder.add_conditional_edges("execute_advance", execute_done, ["execute_assistant", END])
+builder.add_edge("execute_fail", END)
 
 # Start
 builder.add_edge(START, "route_mode")

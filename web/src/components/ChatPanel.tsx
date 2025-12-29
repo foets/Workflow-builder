@@ -14,7 +14,7 @@ interface ChatPanelProps {
 // Detect and extract auth links from content
 function extractAuthLinks(content: string): { cleanContent: string; authLinks: string[] } {
   const authLinks: string[] = [];
-  
+
   // Match various auth URL patterns from Composio and OAuth providers
   const authPatterns = [
     // Composio patterns
@@ -40,7 +40,7 @@ function extractAuthLinks(content: string): { cleanContent: string; authLinks: s
           .replace(/[),.\s\]>]+$/, '')
           .replace(/\)$/, '')
           .replace(/\]$/, '');
-        
+
         // Skip if it's just a domain without path or looks incomplete
         if (cleanUrl.length > 20 && !authLinks.includes(cleanUrl)) {
           authLinks.push(cleanUrl);
@@ -55,7 +55,7 @@ function extractAuthLinks(content: string): { cleanContent: string; authLinks: s
   while ((match = markdownLinkPattern.exec(content)) !== null) {
     const linkText = match[1].toLowerCase();
     const url = match[2].replace(/[),.\s]+$/, '');
-    
+
     // Check if link text suggests authentication
     const authKeywords = ['connect', 'authenticate', 'login', 'authorize', 'oauth', 'sign in', 'link account'];
     if (authKeywords.some(kw => linkText.includes(kw)) && !authLinks.includes(url)) {
@@ -204,7 +204,7 @@ function MarkdownContent({ content }: { content: string }) {
       >
         {cleanContent}
       </ReactMarkdown>
-      
+
       {/* Render auth buttons */}
       {authLinks.length > 0 && (
         <div className="flex flex-wrap gap-2 mt-3">
@@ -304,11 +304,10 @@ export default function ChatPanel({ messages, onSendMessage, isLoading }: ChatPa
             className={`flex min-w-0 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
           >
             <div
-              className={`max-w-[85%] min-w-0 break-words rounded-2xl px-4 py-3 ${
-                message.role === 'user'
+              className={`max-w-[85%] min-w-0 break-words rounded-2xl px-4 py-3 ${message.role === 'user'
                   ? 'bg-[var(--accent)] text-white'
                   : 'bg-[var(--bg-secondary)] text-[var(--text-primary)]'
-              }`}
+                }`}
             >
               {message.role === 'user' ? (
                 <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>

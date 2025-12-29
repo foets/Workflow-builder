@@ -21,7 +21,7 @@ interface WorkflowBuilderProps {
  * - View mode: renders Markdown (a VIEW of the workflow)
  * - Edit mode: edits Workflow JSON (the SOURCE OF TRUTH) and persists via API
  */
-export default function WorkflowBuilder({ 
+export default function WorkflowBuilder({
   workflowId,
   content,
   workflowJson,
@@ -116,8 +116,8 @@ export default function WorkflowBuilder({
                 📁 workflows/{workflowId}.json
               </p>
             )}
-        </div>
-          
+          </div>
+
           {/* Action buttons */}
           <div className="flex items-center gap-2 flex-shrink-0">
             {!isExecuting && (
@@ -139,42 +139,42 @@ export default function WorkflowBuilder({
                   </>
                 ) : (
                   <>
-            <button
+                    <button
                       onClick={() => {
                         setSaveError(null);
                         setIsEditing(true);
                       }}
                       className="px-3 py-1.5 text-sm text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--accent)]/10 rounded-lg transition-colors"
-            >
+                    >
                       ✏️ Edit
-            </button>
+                    </button>
                     {onExecute && (
-            <button
-              onClick={onExecute}
+                      <button
+                        onClick={onExecute}
                         className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
-            >
+                      >
                         ▶ Run
-            </button>
-          )}
+                      </button>
+                    )}
                   </>
                 )}
               </>
             )}
-            
+
             {isExecuting && (
               <div className="flex items-center gap-2 text-blue-400">
                 <span className="animate-spin">⚡</span>
                 <span className="text-sm font-medium">Executing...</span>
               </div>
             )}
+          </div>
         </div>
-      </div>
 
         {/* Progress bar during execution */}
         {isExecuting && stepCount > 0 && currentExecutionStep >= 0 && (
           <div className="mt-3">
             <div className="h-1.5 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
-              <div 
+              <div
                 className="h-full bg-gradient-to-r from-blue-500 to-emerald-500 transition-all duration-500"
                 style={{ width: `${((currentExecutionStep + 1) / stepCount) * 100}%` }}
               />
@@ -184,7 +184,7 @@ export default function WorkflowBuilder({
             </p>
           </div>
         )}
-          </div>
+      </div>
 
       {/* Content Area */}
       <div className="flex-1 overflow-y-auto">

@@ -29,6 +29,15 @@ When the user describes ANY automation they want:
 - Conversation is the interface, but the workflow schema is the source of truth.
 - Prefer fewer steps if it still meets the goal reliably.
 
+## Step outputs (CRITICAL)
+- Each step MUST set `outputs` to a **short output key** (identifier), not a description.
+- This key is used by later steps in templates like `{{steps.0.<outputs_key>...}}`.
+- Rules:
+  - Max 80 characters
+  - Use only letters/numbers/underscore, start with a letter or underscore
+- Good examples: `emails`, `email_full`, `summary_md`, `doc_created`, `append_result`
+- Bad examples: `emails[] (each with id, threadId, ...)`, `metadata + summary`
+
 ## Tool and Toolkit Basics (Explain to user when relevant)
 - Tools are the actions in the workflow steps.
 - Each tool belongs to a toolkit (integration).
@@ -136,6 +145,10 @@ CONFIGURE_SYSTEM_PROMPT_TEMPLATE = """You are configuring a drafted workflow so 
 These config keys must be resolved before execution:
 {missing_config_bullets}
 
+## Current key (resolve ONE at a time)
+- **Now resolving:** {current_config_key}
+- **Hint:** {current_config_hint}
+
 Current `workflow.config`:
 ```json
 {workflow_config_json}
@@ -163,6 +176,9 @@ and persisting them into `workflow.config` using the `set_workflow_config` tool.
    - Always pass the exact `workflow_id` from above.
 7. **Never include raw tool output** and **never include raw OAuth URLs** in chat.
 
+## Common key patterns (examples)
+- If the key looks like a folder id (e.g. `*_folder_id`): list folders from the file storage toolkit (often `googledrive`) and present top 10.\n  - If Drive isn't connected, ask the user to connect it first.\n- If the key looks like a spreadsheet id (e.g. `*_spreadsheet_id`): list/search spreadsheets and present top 10.\n- If the key looks like a sheet/tab name (e.g. `*_tab_name`, `*_sheet_name`): once you have the spreadsheet id, list tabs and let the user pick.\n\nOnly ask the user to paste a raw ID if listing fails.
+
 ## Response format
 - Clean Markdown only.
 - No file paths, no internal debugging, no raw JSON dumps (other than the small config JSON block above).
@@ -178,34 +194,59 @@ EXECUTE_SYSTEM_PROMPT_TEMPLATE = """You are executing a workflow step-by-step.
 ## Workflow
 - **Name:** {workflow_name}
 - **Goal:** {workflow_description}
+- **Tool Router session_id:** {tool_router_session_id}
 
 ## Current Step
 - **Step:** {step_order} / {total_steps}
 - **Name:** {step_name}
-- **Tool:** {step_tool}
-- **Toolkit:** {step_toolkit}
+- **Tool:** `{step_tool}`
+- **Toolkit:** `{step_toolkit}`
 
 ### Instructions
 ```
 {step_instructions}
 ```
 
-### Parameters
+### Parameters (pre-resolved)
 ```json
 {step_params_json}
 ```
 
-## Available Outputs From Previous Steps
+## Outputs From Previous Steps
+```json
 {step_results_json}
+```
 
-## Execution Rules
-1. For external tools: resolve and execute using Tool Router meta-tools:
-   - Use `COMPOSIO_SEARCH_TOOLS` if needed to find the correct tool slug for the step tool.
-   - Execute with `COMPOSIO_MULTI_EXECUTE_TOOL`.
-2. For `AI_PROCESS` steps:
-   - Do the work internally (no external auth/tools).
-3. Keep chat output readable and brief. Use Markdown.
-4. Execute only what the current step requires.
+---
+
+## CRITICAL: Execution Rules
+
+### For EXTERNAL tools (toolkit ≠ "internal"):
+You MUST call `COMPOSIO_MULTI_EXECUTE_TOOL` to execute this step. Do NOT just output text.
+
+**CRITICAL: Make this EXACT tool call (copy-paste the arguments object VERBATIM):**
+```json
+{{
+  "tools": [
+    {{
+      "tool_slug": "{step_tool}",
+      "arguments": {step_params_json}
+    }}
+  ],
+  "session_id": "{tool_router_session_id}"
+}}
+```
+
+⚠️ DO NOT modify, simplify, or omit ANY keys from the arguments object above.
+⚠️ If you see `{{{{steps.X.Y}}}}` placeholders still present, resolve them using values from "Outputs From Previous Steps".
+⚠️ All other values (including `key_column`, `headers`, `start_index`, etc.) are already correct - use them AS-IS.
+
+### For INTERNAL tools (toolkit = "internal", tool = "AI_PROCESS"):
+Do the work yourself (summarize, analyze, format, etc.) and output the result as Markdown. No tool call required.
+
+---
+
+After the tool returns, briefly summarize what happened (1-2 sentences). Do NOT re-explain the workflow or next steps.
 """
 
 

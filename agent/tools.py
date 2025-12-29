@@ -9,6 +9,7 @@ Important separation:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 from langchain_core.tools import tool
@@ -87,6 +88,108 @@ def _workflow_tool_payload(workflow: Workflow) -> str:
     return json.dumps(payload)
 
 
+_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_STEP_REF_RE = re.compile(r"\{\{\s*steps\.(\d+)\.([A-Za-z_][A-Za-z0-9_]*)", flags=re.IGNORECASE)
+
+
+def _iter_strings(obj: Any):
+    """Yield all string leaf values from a JSON-ish structure."""
+    if obj is None:
+        return
+    if isinstance(obj, str):
+        yield obj
+        return
+    if isinstance(obj, list):
+        for it in obj:
+            yield from _iter_strings(it)
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+
+
+def _slugify_key(s: str) -> str:
+    """Best-effort make a short snake_case identifier key."""
+    s = (s or "").strip()
+    if not s:
+        return "output"
+    # Replace non-alnum with underscores and collapse.
+    s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        return "output"
+    # Ensure doesn't start with a digit.
+    if s[0].isdigit():
+        s = f"out_{s}"
+    # Keep reasonably short
+    return s[:80]
+
+
+def _is_valid_output_key(v: Any) -> bool:
+    return isinstance(v, str) and (1 <= len(v) <= 80) and bool(_OUTPUT_KEY_RE.fullmatch(v))
+
+
+def _infer_outputs_key_from_refs(steps: list[dict], step_index: int) -> Optional[str]:
+    """Infer an outputs key by scanning later steps' templates like {{steps.<i>.<key>...}}."""
+    if step_index < 0:
+        return None
+    for j in range(step_index + 1, len(steps)):
+        step = steps[j]
+        if not isinstance(step, dict):
+            continue
+        tool_params = step.get("tool_params")
+        for s in _iter_strings(tool_params):
+            for m in _STEP_REF_RE.finditer(s):
+                try:
+                    idx = int(m.group(1))
+                except Exception:
+                    continue
+                if idx != step_index:
+                    continue
+                key = m.group(2)
+                if _is_valid_output_key(key):
+                    return key
+    return None
+
+
+def _normalize_step_outputs(steps: list[dict]) -> list[dict]:
+    """
+    Normalize each step's `outputs` to be a short identifier key (<=80 chars).
+
+    This prevents schema validation failures and makes templating stable.
+    """
+    out: list[dict] = []
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        step = dict(step)
+
+        raw = step.get("outputs")
+        if _is_valid_output_key(raw):
+            out.append(step)
+            continue
+
+        inferred = _infer_outputs_key_from_refs(steps, i)
+        if _is_valid_output_key(inferred):
+            step["outputs"] = inferred
+            out.append(step)
+            continue
+
+        # Fall back to a slug based on tool/name.
+        base = step.get("outputs") if isinstance(step.get("outputs"), str) else ""
+        if not base:
+            base = step.get("tool") if isinstance(step.get("tool"), str) else ""
+        if not base:
+            base = step.get("name") if isinstance(step.get("name"), str) else ""
+
+        candidate = _slugify_key(str(base))
+        if not _is_valid_output_key(candidate):
+            candidate = "output"
+        step["outputs"] = candidate
+        out.append(step)
+    return out
+
+
 @tool
 def discover_tools(query: str = "") -> str:
     """
@@ -141,6 +244,7 @@ def create_workflow(name: str, description: str, steps: list[dict]) -> str:
         - workflow (object)
         - workflow_markdown (string)
     """
+    steps = _normalize_step_outputs(steps if isinstance(steps, list) else [])
     draft = WorkflowDraft.model_validate(
         {
             "name": name,
@@ -253,7 +357,10 @@ def update_workflow(
         if not step_data:
             return json.dumps({"type": "error", "error": "add_step requires step_data"})
         # Validate step draft and append
-        draft = WorkflowStepDraft.model_validate(step_data)
+        normalized = _normalize_step_outputs([step_data] if isinstance(step_data, dict) else [])
+        if not normalized:
+            return json.dumps({"type": "error", "error": "Invalid step_data"})
+        draft = WorkflowStepDraft.model_validate(normalized[0])
         next_order = len(updated.steps) + 1
         updated.steps.append(
             WorkflowStep(

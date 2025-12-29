@@ -11,12 +11,12 @@ interface WorkflowListProps {
   selectedWorkflowId: string | null;
 }
 
-export default function WorkflowList({ 
-  workflows, 
-  onSelectWorkflow, 
+export default function WorkflowList({
+  workflows,
+  onSelectWorkflow,
   onExecuteWorkflow,
   onDeleteWorkflow,
-  selectedWorkflowId 
+  selectedWorkflowId
 }: WorkflowListProps) {
   if (workflows.length === 0) {
     return (
@@ -35,11 +35,10 @@ export default function WorkflowList({
       {workflows.map((wf) => (
         <div
           key={wf.id}
-          className={`p-3 rounded-lg border cursor-pointer transition-all ${
-            selectedWorkflowId === wf.id
+          className={`p-3 rounded-lg border cursor-pointer transition-all ${selectedWorkflowId === wf.id
               ? 'bg-blue-500/10 border-blue-500/50'
               : 'bg-[var(--bg-tertiary)] border-[var(--border)] hover:border-blue-500/30 hover:bg-[var(--bg-tertiary)]/80'
-          }`}
+            }`}
           onClick={() => onSelectWorkflow(wf.id)}
         >
           <div className="flex-1 min-w-0">
@@ -52,7 +51,7 @@ export default function WorkflowList({
               </p>
             )}
           </div>
-          
+
           <div className="mt-2 pt-2 border-t border-[var(--border)]">
             <div className="flex items-center justify-end gap-1 flex-wrap">
               <button

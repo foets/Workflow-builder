@@ -108,7 +108,15 @@ export default function Home() {
   }, []);
 
   // Run a mode-specific agent call and stream state updates
-  const runAgent = useCallback(async (mode: 'build' | 'preflight' | 'configure' | 'execute', content: string, workflowId?: string | null) => {
+  const runAgent = useCallback(async (
+    mode: 'build' | 'preflight' | 'configure' | 'execute',
+    content: string,
+    workflowId?: string | null,
+    opts?: {
+      streamAssistantMessages?: boolean;
+      onAssistantMessage?: (raw: string) => void;
+    }
+  ) => {
     const client = new Client({ apiUrl: LANGGRAPH_API_URL });
 
     if (!threadIdRef.current) {
@@ -126,6 +134,10 @@ export default function Home() {
 
     let lastAssistantContent = '';
     let lastState: any = null;
+    const streamAssistantMessages = !!opts?.streamAssistantMessages;
+    const onAssistantMessage = opts?.onAssistantMessage;
+    let lastSeenMessagesLen: number | null = null;
+    let streamedAny = false;
 
     for await (const event of stream) {
       if (event.event !== 'values') continue;
@@ -159,6 +171,29 @@ export default function Home() {
       // Pull last assistant message for chat display
       const msgs = data.messages;
       if (Array.isArray(msgs) && msgs.length > 0) {
+        // Optional: stream assistant messages incrementally (used for Execute progress).
+        if (streamAssistantMessages && typeof onAssistantMessage === 'function') {
+          if (lastSeenMessagesLen === null) {
+            // First snapshot: establish baseline to avoid re-appending old thread history.
+            lastSeenMessagesLen = msgs.length;
+          } else {
+            if (msgs.length < lastSeenMessagesLen) lastSeenMessagesLen = msgs.length;
+            const newMsgs = msgs.slice(lastSeenMessagesLen);
+            lastSeenMessagesLen = msgs.length;
+            for (const m of newMsgs) {
+              const isAssistant = m?.type === 'ai' || m?.role === 'assistant';
+              if (!isAssistant) continue;
+              const toolCalls = (m?.tool_calls || m?.toolCalls) as any;
+              const rawContent = typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? '');
+              // Skip tool-call-only messages (no readable content).
+              if (Array.isArray(toolCalls) && toolCalls.length > 0 && !rawContent.trim()) continue;
+              if (!rawContent.trim()) continue;
+              onAssistantMessage(rawContent);
+              streamedAny = true;
+            }
+          }
+        }
+
         const lastMsg = msgs[msgs.length - 1];
         if (lastMsg.type === 'ai' || lastMsg.role === 'assistant') {
           lastAssistantContent = typeof lastMsg.content === 'string'
@@ -168,7 +203,7 @@ export default function Home() {
       }
     }
 
-    return { lastAssistantContent, lastState };
+    return { lastAssistantContent, lastState, streamedAny };
   }, []);
 
   const appendAssistantMessage = useCallback((raw: string) => {
@@ -186,12 +221,21 @@ export default function Home() {
   const runPreflight = useCallback(async (workflowId: string) => {
     const res = await runAgent('preflight', 'Check connections', workflowId);
     appendAssistantMessage(res.lastAssistantContent || '');
-    return (res.lastState?.auth_status || null) as AuthStatusType | null;
+    // Return both auth_status and missing_config_keys for flow gating
+    const authStatus = (res.lastState?.auth_status || null) as AuthStatusType | null;
+    const missingKeys = Array.isArray(res.lastState?.missing_config_keys)
+      ? res.lastState.missing_config_keys.filter((k: any) => typeof k === 'string')
+      : [];
+    return { authStatus, missingKeys };
   }, [appendAssistantMessage, runAgent]);
 
   const runExecute = useCallback(async (workflowId: string) => {
-    const res = await runAgent('execute', 'Execute workflow', workflowId);
-    appendAssistantMessage(res.lastAssistantContent || '');
+    const res = await runAgent('execute', 'Execute workflow', workflowId, {
+      streamAssistantMessages: true,
+      onAssistantMessage: appendAssistantMessage,
+    });
+    // Fallback if the stream didn't emit a readable assistant message.
+    if (!res.streamedAny) appendAssistantMessage(res.lastAssistantContent || '');
     return res.lastState || null;
   }, [appendAssistantMessage, runAgent]);
 
@@ -372,12 +416,17 @@ You can:
       const pre = await runPreflight(targetId);
 
       // 2) If all connected, either configure (if needed) or execute
-      if (pre?.all_connected) {
-        if (Array.isArray(missingConfigKeys) && missingConfigKeys.length > 0) {
+      if (pre?.authStatus?.all_connected) {
+        // Use fresh missing_config_keys from preflight response, not stale React state
+        const freshMissingKeys = pre.missingKeys || [];
+        if (freshMissingKeys.length > 0) {
+          // Update React state for UI display
+          setMissingConfigKeys(freshMissingKeys);
+
           const cfgMsg: Message = {
             id: `msg_${Date.now()}_need_cfg`,
             role: 'assistant',
-            content: `## 🧩 Configuration Needed\n\nThis workflow needs a bit more configuration before it can run:\n\n- ${missingConfigKeys.map(k => `**${k}**`).join('\\n- ')}\n\nI’ll guide you through picking these values now.`,
+            content: `## 🧩 Configuration Needed\n\nThis workflow needs a bit more configuration before it can run:\n\n- ${freshMissingKeys.map((k: string) => `**${k}**`).join('\\n- ')}\n\nI'll guide you through picking these values now.`,
             timestamp: new Date(),
           };
           setMessages(prev => [...prev, cfgMsg]);
@@ -462,13 +511,12 @@ Failed to execute workflow. Error: ${error instanceof Error ? error.message : 'U
               </h3>
               <div className="flex items-center gap-2">
                 <span
-                  className={`inline-block h-2 w-2 rounded-full ${
-                    workflowApiOk === true
-                      ? 'bg-emerald-500'
-                      : workflowApiOk === false
-                        ? 'bg-red-500'
-                        : 'bg-amber-400'
-                  }`}
+                  className={`inline-block h-2 w-2 rounded-full ${workflowApiOk === true
+                    ? 'bg-emerald-500'
+                    : workflowApiOk === false
+                      ? 'bg-red-500'
+                      : 'bg-amber-400'
+                    }`}
                   title={
                     workflowApiOk === true
                       ? 'Workflow API: online'
